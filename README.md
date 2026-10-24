@@ -11,7 +11,6 @@ Archived version: https://doi.org/10.5281/zenodo.XXXXXXX
 ```
 HDI_Ranjbaran_et_al.Rmd     main pipeline: grid, six inputs, HDI, PCA, results, sensitivity analyses
 scripts/                    companion scripts for figures and descriptive analyses (read metrics_complete.csv)
-data/perimeter/             Alpine Convention perimeter used for clipping (see licence note below)
 LICENSE                     MIT licence for the code
 CITATION.cff                how to cite this repository
 ```
@@ -47,7 +46,7 @@ The sensitivity analyses use 10,000 resamples each and are slow. On a cluster, s
 
 ## Alpine Convention perimeter
 
-`data/perimeter/` contains the Alpine Convention Perimeter, edition v2_2018 (author: A. Piva, 2020). © Permanent Secretariat of the Alpine Convention (PSAC). Downloaded from the Alpine Convention Atlas (https://www.atlas.alpconv.org/layers/geonode:Alpine_Convention_Perimeter_2018_v2) and licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). ⟦Used unmodified. / Reprojected from EPSG:3034 to EPSG:3035.⟧
+Occurrences were clipped to the Alpine Convention Perimeter, edition v2_2018 (author: A. Piva, 2020; © Permanent Secretariat of the Alpine Convention, PSAC). The polygon is not redistributed here. Download it from the Alpine Convention Atlas: https://www.atlas.alpconv.org/layers/geonode:Alpine_Convention_Perimeter_2018_v2 (licence: CC BY 4.0).
 
 ## Credits
 
