@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the article and this archived version."
+title: "Herbarium Density Index (HDI) for the Alpine flora: code"
+version: "1.0.0"
+license: MIT
+date-released: "2026-10-24"
+repository-code: "https://github.com/Yasi-RNJ/HDI-Alps"
+authors:
+  - family-names: Ranjbaran
+    given-names: Yasaman
+    affiliation: University of Padova
+  - family-names: Canella
+    given-names: Marco
+    affiliation: University of Padova
+  - family-names: Dubbini
+    given-names: Nevio
+    affiliation: Miningful Studio
+  - family-names: Singh
+    given-names: Garima
+  - family-names: Beltran-Sanz
+    given-names: Núria
+  - family-names: Petruzzellis
+    given-names: Francesco
+    affiliation: University of Padova
+  - family-names: Dal Grande
+    given-names: Francesco
+    affiliation: University of Padova

@@ -1,0 +1,1176 @@
+---
+title: "Herbarium Density Index (HDI): construction and sensitivity analyses"
+subtitle: "Supporting code for Ranjbaran et al."
+author:
+  - "Nevio Dubbini, Miningful Studio (original report and first implementation of the occurrence indices)"
+  - "Yasaman Ranjbaran, University of Padova (HDI construction and sensitivity analyses)"
+date: "`r format(Sys.time(), '%d/%m/%Y')`"
+output:
+  html_document:
+    theme: spacelab
+    highlight: espresso
+    code_folding: show
+    fig_caption: yes
+    fig_width: 9
+    fig_height: 6
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+editor_options:
+  chunk_output_type: console
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 6)
+options(width = 110)
+```
+
+The first version of this report, and the first implementation of the
+occurrence indices it is built on, were produced by Nevio Dubbini at Miningful
+Studio ([www.miningfulstudio.eu](http://www.miningfulstudio.eu)). The index
+construction documented in Part B, and every sensitivity analysis in Part E,
+were added by Yasaman Ranjbaran for the revised manuscript.
+
+<br>
+
+# Scope and what changed
+
+This file reproduces the Herbarium Density Index (HDI) exactly as reported in
+the manuscript, and runs each of the sensitivity analyses the paper cites. It
+replaces the original exploratory report. The substantive differences from
+that report are listed here so that a reader comparing the two can see what
+moved and why.
+
+| Element | Original report | This version |
+|---|---|---|
+| Spatial unit | 0.01 degree bins on raw longitude and latitude | 10 x 10 km cells on ETRS89-LAEA, EPSG:3035 |
+| Spatial inequality | `lctools::spGini` on coordinate pairs | sample Gini of specimen counts across occupied cells |
+| Gini range | raw `G`, whose complement has a species-specific floor of `1/n` | `G* = G * n/(n-1)`, so `1 - G*` spans `[0, 1]` for every species |
+| Unoccupied units | temporal series padded with zeros for every empty decade | both Gini coefficients computed over occupied units only |
+| Temporal window | all years present in the file | 1740 to 2019, 28 complete decadal bins anchored to the window start |
+| Modern window | all years present in the file | 2000 to 2019, ending with the herbarium series |
+| Undated specimens | dropped by `drop_na()` | kept for intensity and the spatial terms, excluded from the temporal terms only |
+| Aggregation | first principal component of the six inputs, rescaled 0 to 100 | equally weighted geometric mean of four dimensions, `100 * (I*S*T*O)^(1/4)` |
+| Role of the PCA | the index itself | a description of how the six inputs covary, nothing more |
+| Overlap | percentage of modern binned locations also present in the herbarium set | unchanged in definition; computed on the 10 km grid, and `NA` rather than `0` when a species has no modern record |
+| Sensitivity | none | resolution, weights, functional form, dimension removal, variance decomposition, record resampling |
+
+Two points of substance behind the table. First, the original index was the
+first principal component, and the sign of a principal component is arbitrary,
+so whether overlap was rewarded or penalised was not fixed by the method. The
+revised index states its weights in advance instead. Second, padding the
+decadal series with zeros made the temporal Gini largely a restatement of
+temporal coverage, a quantity already entering the index separately: in the
+original implementation the temporal Gini and the number of occupied decades
+correlate at rho = -0.949, against rho = 0.413 here.
+
+<br>
+
+# Part A. Data, grid and the six inputs
+
+## A.1 Configuration
+
+Every constant that the manuscript states is set here and nowhere else.
+
+```{r config}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(sf)
+  library(ggplot2)
+})
+
+## ---- paths ---------------------------------------------------------------
+## Set HDI_BASE to the directory holding the four input files, or leave it and
+## place them next to this file. On the cluster this was
+## /data/fdalgrande_data/HDI-YASI.
+BASE_DIR  <- Sys.getenv("HDI_BASE", ".")
+OUT_DIR   <- file.path(BASE_DIR, "HDI_output")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+HERB_FILE <- file.path(BASE_DIR, "herbaria_occurrences_filtered.csv")
+MOD_FILE  <- file.path(BASE_DIR, "current_occurrences_enriched.csv")
+SPP_FILE  <- file.path(BASE_DIR, "species_index_full_info.csv")       # sep = ";"
+ATTR_FILE <- file.path(BASE_DIR, "species_index_full_info_all_info.csv")  # sep = ";"
+
+## ---- resolution ----------------------------------------------------------
+EPSG_LAEA   <- 3035          # ETRS89 Lambert Azimuthal Equal Area
+GRID_KM     <- 10            # EEA reference grid spacing (INSPIRE)
+BIN_YR      <- 10            # decadal bins
+
+## ---- windows -------------------------------------------------------------
+HERB_WINDOW <- c(1740, 2019) # 28 complete decadal bins; 1700-1739 hold no
+                             # dated Alpine specimen in this dataset
+MOD_WINDOW  <- c(2000, 2019) # ends with the herbarium series; 2020 onward is
+                             # the pandemic recording surge
+MOD_LOAD_MAX <- 2025         # loaded, not analysed; needed by one sensitivity run
+
+## ---- conventions ---------------------------------------------------------
+UNC_MAX      <- 10000        # coordinateUncertaintyInMeters cutoff, sensitivity only
+APPLY_UNC    <- FALSE        # off in the reported analysis
+GINI_N1      <- 0            # one occupied unit is trivially even
+GINI_CORRECT <- TRUE         # divide G by its attainable maximum (n-1)/n
+
+## ---- sensitivity effort --------------------------------------------------
+B_WEIGHTS <- 10000           # Dirichlet draws per concentration
+B_BOOT    <- 10000           # record resamples per species
+B_VAR     <- 10000           # species resamples for the variance decomposition
+ALPHAS    <- c(1, 5, 10, 20, 50)
+CORES     <- max(1L, as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "4")))
+set.seed(20260928)
+
+## Species excluded after manual review. They are retained in the output table
+## with their computed inputs and the reason, and excluded from all statistics.
+EXCLUDE <- data.table(
+  species = c("Achillea alpina", "Potentilla thyrsiflora"),
+  exclusion_reason = c("native to eastern Asia and North America",
+                       "no establishment status, probably of hybrid origin"))
+
+setDTthreads(0L)
+cat("grid:", GRID_KM, "km   bins:", BIN_YR, "yr   GINI_CORRECT:", GINI_CORRECT, "\n")
+```
+
+## A.2 The Gini coefficient and its small-sample correction
+
+A sample Gini cannot reach 1. The most unequal arrangement possible with `n`
+units puts every specimen in one unit, which gives `G = (n-1)/n`. The
+complement `1 - G` therefore carries a floor of `1/n` that depends on how many
+units a species occupies: a species in two cells could never score below 0.50
+however concentrated it was, while one in 500 cells could reach 0.002.
+Expressing the coefficient as a fraction of its attainable range puts both
+evenness terms on `[0, 1]` for every species, matching how the other inputs are
+normalised (Damgaard & Weiner 2000; Deltas 2003).
+
+```{r gini}
+gini <- function(x, n1 = GINI_N1, correct = GINI_CORRECT) {
+  x <- x[!is.na(x)]
+  n <- length(x)
+  if (n == 0L) return(NA_real_)
+  if (n == 1L) return(n1)             # one occupied unit: trivially even
+  s <- sum(x)
+  if (s <= 0) return(NA_real_)
+  x <- sort(x)
+  g <- sum((2 * seq_len(n) - n - 1) * x) / (n * s)
+  if (correct) g <- min(g * n / (n - 1), 1)
+  g
+}
+
+## verification of the two boundary cases and of the correction itself
+cat("perfectly even, 5 units  : G* =", gini(rep(4, 5)), "\n")
+cat("all in one of 5 units    : G* =", gini(c(20, 0, 0, 0, 0)), "\n")
+cat("uncorrected equivalent   : G  =", gini(c(20, 0, 0, 0, 0), correct = FALSE),
+    " = (n-1)/n =", 4/5, "\n")
+cat("single occupied unit     : G* =", gini(20), "\n")
+```
+
+## A.3 Projection and grid assignment
+
+The Alps span roughly six degrees of latitude, across which the east to west
+extent of a cell defined in degrees varies by 10.3%. A degree-based grid would
+make the same species appear to occupy more ground in the south than in the
+north, so coordinates are projected to an equal-area system before cells are
+assigned. The axis-order guard below is not decoration: `sf_project` returning
+coordinates in the wrong order produces maps and metrics that look plausible
+and are wrong.
+
+```{r project}
+add_cells <- function(dt, grid_km, chunk = 2e6) {
+  cell_m <- grid_km * 1000
+  n  <- nrow(dt)
+  gx <- integer(n); gy <- integer(n)
+  for (i in seq(1L, n, by = chunk)) {
+    j  <- min(i + chunk - 1L, n)
+    xy <- sf::sf_project(
+      from = "EPSG:4326", to = paste0("EPSG:", EPSG_LAEA),
+      pts  = as.matrix(dt[i:j, .(decimalLongitude, decimalLatitude)]))
+    gx[i:j] <- as.integer(floor(xy[, 1] / cell_m))
+    gy[i:j] <- as.integer(floor(xy[, 2] / cell_m))
+  }
+  dt[, cell := paste(gx, gy, sep = "_")]
+  dt[]
+}
+
+chk <- sf::sf_project("EPSG:4326", paste0("EPSG:", EPSG_LAEA), cbind(11, 46))
+cat("axis check (11E, 46N) -> X", round(chk[1]), " Y", round(chk[2]), "\n")
+stopifnot(abs(chk[1] - 4398558) < 5000, abs(chk[2] - 2543530) < 5000)
+```
+
+## A.4 Reading the records
+
+Undated specimens are kept. They carry valid coordinates, so they belong in
+the specimen count and in both spatial metrics; they are excluded from the
+temporal metrics only, where a missing year makes them unusable.
+
+```{r read}
+ACC <- data.table(dataset = character(), step = character(),
+                  n_records = integer(), n_species = integer())
+log_step <- function(dt, dataset, step) {
+  ACC <<- rbind(ACC, data.table(
+    dataset = dataset, step = step, n_records = nrow(dt),
+    n_species = uniqueN(dt$species[!is.na(dt$species) & dt$species != ""])))
+  cat(sprintf("%-10s %-42s %12s rows  %6s spp\n", dataset, step,
+              format(nrow(dt), big.mark = ","),
+              format(uniqueN(dt$species), big.mark = ",")))
+}
+
+## ---- species list --------------------------------------------------------
+spp <- fread(SPP_FILE, sep = ";")
+SP  <- unique(trimws(spp$species)); SP <- SP[nzchar(SP)]
+cat("checklist species:", length(SP), "\n\n")
+
+## ---- herbarium -----------------------------------------------------------
+h <- fread(HERB_FILE)
+if (length(grep("^field_", names(h)))) h[, (grep("^field_", names(h), value = TRUE)) := NULL]
+h[, species := trimws(species)]
+for (v in c("decimalLatitude", "decimalLongitude", "year",
+            "coordinateUncertaintyInMeters"))
+  if (v %in% names(h)) set(h, j = v, value = as.numeric(h[[v]]))
+
+log_step(h, "herbarium", "raw file")
+h <- h[!is.na(decimalLatitude) & !is.na(decimalLongitude)]
+log_step(h, "herbarium", "has coordinates")
+h <- h[species %in% SP]
+log_step(h, "herbarium", "in the Alpine checklist")
+
+h[, dated := !is.na(year) & year >= HERB_WINDOW[1] & year <= HERB_WINDOW[2]]
+cat(sprintf("  undated or outside %d-%d: %s (%.1f%%), kept for intensity and space\n\n",
+            HERB_WINDOW[1], HERB_WINDOW[2],
+            format(sum(!h$dated), big.mark = ","), 100 * mean(!h$dated)))
+
+## ---- modern --------------------------------------------------------------
+m <- fread(MOD_FILE)
+m[, species := trimws(species)]
+for (v in c("decimalLatitude", "decimalLongitude", "year",
+            "coordinateUncertaintyInMeters"))
+  if (v %in% names(m)) set(m, j = v, value = as.numeric(m[[v]]))
+
+log_step(m, "modern", "raw file")
+m <- m[!is.na(decimalLatitude) & !is.na(decimalLongitude)]
+log_step(m, "modern", "has coordinates")
+m <- m[species %in% SP]
+log_step(m, "modern", "in the Alpine checklist")
+m <- m[!is.na(year) & year >= MOD_WINDOW[1] & year <= MOD_LOAD_MAX]
+log_step(m, "modern", sprintf("year %d-%d (loaded)", MOD_WINDOW[1], MOD_LOAD_MAX))
+log_step(m[year <= MOD_WINDOW[2]], "modern",
+         sprintf("year %d-%d (reported analysis)", MOD_WINDOW[1], MOD_WINDOW[2]))
+
+fwrite(ACC, file.path(OUT_DIR, "record_accounting.csv"))
+```
+
+## A.5 Provenance of the digitised record
+
+The index measures the archive as currently mobilised, not the physical
+holdings of the world's herbaria. These tables are what that claim rests on.
+
+```{r provenance}
+if (all(c("institutionCode", "collectionCode") %in% names(h))) {
+  by_cols <- intersect(c("institutionCode", "collectionCode", "datasetKey"), names(h))
+  ph <- h[, .(records = .N, species = uniqueN(species)), by = by_cols][order(-records)]
+  ph[, pct := round(100 * records / sum(records), 3)]
+  fwrite(ph, file.path(OUT_DIR, "provenance_herbarium.csv"))
+  cat("institutions:", uniqueN(h$institutionCode),
+      "   records with no institution code:",
+      h[is.na(institutionCode) | institutionCode == "", .N],
+      sprintf("(%.1f%%)\n", 100 * mean(is.na(h$institutionCode) | h$institutionCode == "")))
+  print(head(h[, .(records = .N), by = institutionCode][order(-records)], 10))
+}
+if ("mediaType" %in% names(h))
+  cat("\nsheets carrying an image:", round(100 * mean(h$mediaType != ""), 1), "%\n")
+```
+
+## A.6 The six inputs and the index, in one function
+
+The six quantities, in the order the manuscript gives them. Two are counts:
+the total number of specimens `s`, dated or not, and the number of distinct
+10 km cells holding at least one specimen `c`. Two are evenness terms, each
+one minus a corrected Gini: spatial evenness `E_s` over specimen counts across
+occupied cells, and temporal evenness `E_t` over specimen counts across
+occupied decadal bins. Temporal coverage `K` is the number of occupied decadal
+bins divided by the 28 available. Historical to modern overlap `v` is the
+percentage of a species' contemporary cells that also hold a specimen.
+
+Two conventions decide the behaviour of the evenness terms and are applied
+here rather than downstream. Specimens are summed per cell before the Gini is
+taken, so the statistic measures how evenly collecting effort is spread rather
+than how many cells were visited. And both Gini coefficients are computed over
+occupied units only: a cell a species does not occupy is its absence, not
+evidence of uneven collecting, and counting it otherwise would conflate range
+size with collecting bias and make the statistic depend on where the study
+boundary is drawn.
+
+```{r builder}
+build_metrics <- function(hh_in, mm_in, grid_km, bin_yr,
+                          herb_window = HERB_WINDOW, gini_n1 = GINI_N1,
+                          species_list = SP) {
+
+  hh <- add_cells(copy(hh_in), grid_km)
+  mm <- add_cells(copy(mm_in), grid_km)
+
+  span   <- herb_window[2] - herb_window[1] + 1
+  n_bins <- span / bin_yr
+  if (abs(n_bins - round(n_bins)) > 1e-9)
+    stop(sprintf("bin width %d does not divide the %d-year window evenly",
+                 bin_yr, span))
+  n_bins <- as.integer(round(n_bins))
+
+  ## bins anchored to the window start, not to round calendar years, so that
+  ## every width tested divides the 280-year span exactly
+  hh[dated == TRUE,
+     tbin := herb_window[1] + floor((year - herb_window[1]) / bin_yr) * bin_yr]
+
+  ## intensity and space: all sheets. Sheets summed per cell BEFORE the Gini.
+  per_cell <- hh[, .(sheets = .N), by = .(species, cell)]
+  sp_spat  <- per_cell[, .(n_cells = .N, spatial_gini = gini(sheets, gini_n1)),
+                       by = species]
+  sp_int   <- hh[, .(n_sheets = .N), by = species]
+
+  ## time: dated sheets, occupied bins only
+  per_bin <- hh[dated == TRUE, .(sheets = .N), by = .(species, tbin)]
+  sp_temp <- per_bin[, .(n_bins_occupied = .N, n_sheets_dated = sum(sheets),
+                         temporal_gini = gini(sheets, gini_n1)), by = species]
+
+  ## modern side and overlap
+  mcells <- unique(mm[, .(species, cell)])
+  hcells <- unique(hh[, .(species, cell)])
+  sp_mod <- mm[, .(n_modern = .N), by = species]
+
+  ov <- merge(mcells[, .(n_cells_modern = .N), by = species],
+              hcells[, .(n_cells_herb   = .N), by = species],
+              by = "species", all = TRUE)
+  inter <- merge(mcells, hcells, by = c("species", "cell"))[
+    , .(n_cells_shared = .N), by = species]
+  ov <- merge(ov, inter, by = "species", all.x = TRUE)
+  for (v in c("n_cells_shared", "n_cells_modern", "n_cells_herb"))
+    ov[is.na(get(v)), (v) := 0L]
+
+  ## The denominator is the number of MODERN cells, because the quantity of
+  ## interest is how much of a species' present distribution has a historical
+  ## baseline. Overlap is undefined, not zero, with no modern records.
+  ov[, overlap_pct := fifelse(n_cells_modern > 0,
+                              100 * n_cells_shared / n_cells_modern, NA_real_)]
+  ov[, `:=`(cells_retained = n_cells_shared,
+            cells_lost     = n_cells_herb   - n_cells_shared,
+            cells_gained   = n_cells_modern - n_cells_shared)]
+
+  out <- Reduce(function(a, b) merge(a, b, by = "species", all.x = TRUE),
+                list(data.table(species = species_list),
+                     sp_int, sp_spat, sp_temp, sp_mod, ov))
+
+  for (v in c("n_sheets", "n_cells", "n_bins_occupied", "n_sheets_dated",
+              "n_modern", "n_cells_modern", "n_cells_herb", "n_cells_shared",
+              "cells_retained", "cells_lost", "cells_gained"))
+    out[is.na(get(v)), (v) := 0L]
+
+  ## evenness is reported in place of the Gini, so that higher is better on
+  ## all six inputs
+  out[, spatial_evenness  := 1 - spatial_gini]
+  out[, temporal_evenness := 1 - temporal_gini]
+  out[, `:=`(n_bins_possible = n_bins, bin_yr = bin_yr, grid_km = grid_km)]
+
+  ## ---- normalisation ------------------------------------------------------
+  ## Three inputs are strongly right-skewed, so a log(1+x) transform precedes
+  ## division by the maximum. The transform pulls in the long tail without
+  ## changing the order of species. Overlap is divided by log(1+100) because
+  ## 100% is its fixed ceiling, not a value observed in this dataset.
+  out[, intensity := log1p(n_sheets) / log1p(max(n_sheets, na.rm = TRUE))]
+  out[, breadth   := log1p(n_cells)  / log1p(max(n_cells,  na.rm = TRUE))]
+  out[, coverage  := pmin(n_bins_occupied / n_bins, 1)]
+  out[, overlap   := log1p(overlap_pct) / log1p(100)]
+
+  ## ---- pairing, then aggregation -----------------------------------------
+  ## Space and time are each described by two things: how much of it a species
+  ## covers, and how evenly its specimens are spread across it. Neither is
+  ## sufficient alone, so each pair is a geometric mean.
+  out[, spatial  := sqrt(breadth  * spatial_evenness)]
+  out[, temporal := sqrt(coverage * temporal_evenness)]
+  out[, HDI      := 100 * (intensity * spatial * temporal * overlap)^(1/4)]
+
+  out[, HDI_rank   := frank(-HDI, na.last = "keep")]
+  out[, HDI_pctile := round(100 * (1 - (HDI_rank - 1) / sum(!is.na(HDI))), 2)]
+
+  out[, reliability := fifelse(
+    n_sheets == 0,                             "no_herbarium_records",
+    fifelse(is.na(overlap_pct),                "no_modern_records",
+    fifelse(n_cells < 2 | n_bins_occupied < 2, "degenerate_gini",
+    fifelse(n_sheets < 5,                      "very_sparse", "ok"))))]
+  out[]
+}
+```
+
+## A.7 The reported run
+
+```{r baseline}
+baseline <- build_metrics(h, m[year <= MOD_WINDOW[2]], GRID_KM, BIN_YR)
+
+## species attributes, with an allowlist so that no stale count can travel in
+ATTR_COLS <- c("order", "family", "genus", "iucn_assessment", "wcvp_endemic",
+               "wcvp_lifeform_description", "wcvp_climate_description",
+               "wcvp_introduced", "wcvp_native", "establishment")
+if (file.exists(ATTR_FILE)) {
+  attr <- fread(ATTR_FILE, sep = ";")
+  keep <- intersect(ATTR_COLS, names(attr))
+  attr <- unique(attr[, c("species", keep), with = FALSE])
+  attr[, species := trimws(species)]
+  stopifnot(!anyDuplicated(attr$species))
+  ## guard: nothing that looks like a metric may arrive from a lookup file
+  FORBIDDEN <- c("^n_sheets", "^n_cells", "^n_bins", "^n_modern", "^N_samples",
+                 "^spatial", "^temporal", "^intensity$", "^breadth$",
+                 "^overlap", "^HDI", "^cells_", "^reliability$")
+  bad <- keep[vapply(keep, function(cc)
+    any(vapply(FORBIDDEN, function(p) grepl(p, cc), logical(1))), logical(1))]
+  if (length(bad)) stop("lookup columns look like metrics: ", paste(bad, collapse = ", "))
+  stopifnot(length(intersect(keep, names(baseline))) == 0L)
+  n0 <- nrow(baseline); hdi0 <- sum(baseline$HDI, na.rm = TRUE)
+  baseline <- merge(baseline, attr, by = "species", all.x = TRUE, sort = FALSE)
+  stopifnot(nrow(baseline) == n0,
+            isTRUE(all.equal(sum(baseline$HDI, na.rm = TRUE), hdi0)))
+  cat("attributes joined, metrics unchanged\n")
+}
+
+## manual exclusions
+baseline <- merge(baseline, EXCLUDE, by = "species", all.x = TRUE, sort = FALSE)
+baseline[, in_analysis := is.na(exclusion_reason)]
+cat("species in the checklist :", nrow(baseline), "\n")
+cat("excluded after review    :", baseline[in_analysis == FALSE, .N],
+    paste0("(", paste(EXCLUDE$species, collapse = ", "), ")"), "\n")
+
+d <- baseline[in_analysis == TRUE]
+cat("species analysed         :", nrow(d), "\n")
+cat("scored                   :", sum(!is.na(d$HDI)), "\n")
+
+fwrite(baseline, file.path(OUT_DIR, "metrics_complete.csv"))
+```
+
+```{r baseline_checks}
+cat("=== accounting of the unscored ===\n")
+print(d[is.na(HDI), .N, by = reliability][order(-N)])
+cat("\n=== reliability flags, all analysed species ===\n")
+print(d[, .N, by = reliability][order(-N)])
+cat("\n=== the six inputs and the four dimensions ===\n")
+print(summary(d[, .(n_sheets, n_cells, n_bins_occupied, spatial_evenness,
+                    temporal_evenness, overlap_pct)]))
+print(d[, .(dimension = c("intensity", "spatial", "temporal", "overlap"),
+            median = round(c(median(intensity, na.rm = TRUE),
+                             median(spatial,   na.rm = TRUE),
+                             median(temporal,  na.rm = TRUE),
+                             median(overlap,   na.rm = TRUE)), 3),
+            max = round(c(max(intensity, na.rm = TRUE), max(spatial, na.rm = TRUE),
+                          max(temporal, na.rm = TRUE), max(overlap, na.rm = TRUE)), 3))])
+
+cat("\nHDI vs specimen count, Spearman:",
+    round(cor(d$n_sheets, d$HDI, method = "spearman", use = "complete.obs"), 3), "\n")
+cat("HDI vs occupied cells,  Spearman:",
+    round(cor(d$n_cells,  d$HDI, method = "spearman", use = "complete.obs"), 3), "\n")
+cat("specimens vs cells,     Spearman:",
+    round(cor(d$n_sheets, d$n_cells, method = "spearman", use = "complete.obs"), 3), "\n")
+cat("scoring exactly zero:", d[HDI == 0, .N], "\n")
+cat("  of which no contemporary cell holds a specimen:",
+    d[HDI == 0 & overlap_pct == 0, .N], "\n")
+
+## the ceiling: even a species holding all four maxima at once cannot reach 100
+cat("\nattainable maximum if one species held every dimension's maximum:",
+    round(100 * (max(d$intensity, na.rm = TRUE) * max(d$spatial, na.rm = TRUE) *
+                 max(d$temporal,  na.rm = TRUE) * max(d$overlap, na.rm = TRUE))^(1/4), 1), "\n")
+
+FOCAL <- c("Cystopteris fragilis", "Gentiana bavarica", "Larix decidua",
+           "Jacobaea uniflora", "Dracocephalum ruyschiana", "Androsace brevis",
+           "Callianthemum anemonoides")
+print(d[species %in% FOCAL,
+        .(species, n_sheets, n_cells, n_bins_occupied,
+          sp_even = round(spatial_evenness, 2), tm_even = round(temporal_evenness, 2),
+          overlap = round(overlap_pct, 1), HDI = round(HDI, 2), HDI_rank)][order(HDI_rank)])
+```
+
+<br>
+
+# Part B. What the index is, stated once
+
+```
+I  = log(1 + s) / log(1 + s_max)              specimen intensity
+Bd = log(1 + c) / log(1 + c_max)              spatial breadth
+K  = occupied decadal bins / 28               temporal coverage
+O  = log(1 + v) / log(1 + 100)                historical to modern overlap
+
+S  = sqrt(Bd * E_s)                           spatial documentation
+T  = sqrt(K  * E_t)                           temporal documentation
+
+HDI = 100 * (I * S * T * O)^(1/4)
+```
+
+The four dimensions are multiplied rather than averaged, so a species scoring
+near zero on any one of them scores near zero overall. This is intended. A
+taxon with abundant specimens but no historical to modern correspondence
+cannot support a temporal comparison, and an index in which specimen count
+made up for that would recommend it. Equal weights are a stated assumption
+rather than an estimate: no external criterion establishes that one dimension
+matters more than another, and the OECD and JRC guidance treats equal
+weighting as the appropriate default in that situation. Because the choice is
+not forced by the data, its effect on the ranking is measured in Part E.
+
+HDI is a relative measure. The normalising maxima come from this dataset, so a
+score places a species within the Alpine flora as currently digitised rather
+than on an absolute scale, and scores are not comparable across datasets
+without recomputation.
+
+<br>
+
+# Part C. The PCA, as a description only
+
+The ordination summarises how the six inputs covary. It does not produce the
+index. It is reported because the covariance structure is itself informative,
+and because the previous implementation derived the index from it.
+
+```{r pca}
+PCA_VARS <- c("intensity", "breadth", "spatial_evenness",
+              "coverage", "temporal_evenness", "overlap")
+pd <- d[complete.cases(d[, ..PCA_VARS])]
+X  <- scale(as.matrix(pd[, ..PCA_VARS]))
+pc <- prcomp(X, scale. = FALSE)
+
+cat("=== variance explained ===\n")
+print(round(data.frame(sd = pc$sdev,
+                       prop = pc$sdev^2 / sum(pc$sdev^2),
+                       cum  = cumsum(pc$sdev^2) / sum(pc$sdev^2)), 4))
+cat("\n=== loadings, first three components ===\n")
+print(round(pc$rotation[, 1:3], 3))
+
+## correlation structure and variance inflation, the reason the pairs are
+## multiplied rather than entered separately
+CM <- cor(pd[, ..PCA_VARS], use = "complete.obs")
+cat("\n=== pairwise correlations ===\n"); print(round(CM, 3))
+cat("\nlargest off-diagonal correlation:",
+    round(max(abs(CM[upper.tri(CM)])), 3), "\n")
+vif <- diag(solve(CM))
+cat("\n=== variance inflation factors ===\n"); print(round(vif, 1))
+cat("\nCollinearity inflates the variance of ESTIMATED parameters. This index\n",
+    "estimates none: the weights are set in advance and the aggregation is a\n",
+    "fixed function. What the collinearity does mean is that the dimensions are\n",
+    "not independent sources of information, which is why extent and evenness\n",
+    "are paired multiplicatively and why Part E.5 measures each dimension's\n",
+    "contribution rather than assuming it.\n")
+
+pca_dt <- data.table(PC1 = pc$x[, 1], PC2 = pc$x[, 2], HDI = pd$HDI)
+ggplot(pca_dt, aes(PC1, PC2, colour = HDI)) +
+  geom_point(alpha = .3, size = .7) +
+  scale_colour_viridis_c(option = "viridis") +
+  labs(title = "The six inputs, summarised",
+       subtitle = "The ordination describes covariation; it is not the index") +
+  theme_minimal(base_size = 11)
+```
+
+<br>
+
+# Part D. Reported results
+
+## D.1 Distribution
+
+```{r results_dist}
+sc <- copy(d[!is.na(HDI)])
+cat("scored species:", nrow(sc), "\n")
+print(round(summary(sc$HDI), 2))
+cat("median:", round(median(sc$HDI), 2),
+    "  IQR:", paste(round(quantile(sc$HDI, c(.25, .75)), 2), collapse = " to "), "\n")
+cat("scoring exactly zero:", sc[HDI == 0, .N], "\n")
+nz <- sc[HDI > 0]
+cat("terciles among the", nrow(nz), "species above zero:",
+    paste(round(quantile(nz$HDI, c(1/3, 2/3)), 2), collapse = " and "), "\n")
+
+cat("\nwhich species holds each maximum:\n")
+print(data.table(
+  quantity = c("specimens", "occupied cells", "spatial documentation",
+               "temporal documentation", "HDI"),
+  species  = c(sc[which.max(n_sheets), species], sc[which.max(n_cells), species],
+               sc[which.max(spatial), species], sc[which.max(temporal), species],
+               sc[which.max(HDI), species]),
+  value    = round(c(max(sc$n_sheets), max(sc$n_cells), max(sc$spatial),
+                     max(sc$temporal), max(sc$HDI)), 2)))
+cat("species reaching 100% overlap:", sc[overlap_pct == 100, .N],
+    " median contemporary cells among them:",
+    sc[overlap_pct == 100, median(n_cells_modern)], "\n")
+cat("correlation, overlap against contemporary cell count (Pearson):",
+    round(cor(sc$overlap_pct, sc$n_cells_modern, use = "complete.obs"), 3), "\n")
+```
+
+## D.2 Where the ranking departs from specimen count
+
+```{r results_departure}
+sc[, rank_sheets := frank(-n_sheets, ties.method = "average")]
+sc[, shift := abs(HDI_rank - rank_sheets)]
+cat("median |rank shift| against a specimen-count ranking:", median(sc$shift), "\n")
+cat("moving at least 500 positions:", sc[shift >= 500, .N],
+    sprintf("(%.1f%%)\n", 100 * mean(sc$shift >= 500)))
+cat("moving at least 1000 positions:", sc[shift >= 1000, .N],
+    sprintf("(%.1f%%)\n", 100 * mean(sc$shift >= 1000)))
+
+dec <- sc[rank_sheets <= ceiling(.1 * nrow(sc))]
+cat("\nwithin the top specimen decile (", nrow(dec), " species):\n", sep = "")
+print(dec[, .(species = .N, median_HDI_rank = median(HDI_rank)),
+          by = .(low_overlap = overlap_pct < 15)])
+```
+
+## D.3 Alpine endemics
+
+Three tests are reported because the distribution is left-skewed and contains
+many zeros, and no single test handles both well.
+
+```{r results_endemic}
+if ("wcvp_endemic" %in% names(sc)) {
+  e <- copy(sc[!is.na(wcvp_endemic) & wcvp_endemic != "" &
+            tolower(as.character(wcvp_endemic)) != "missing data"])
+  e[, endemic := fifelse(tolower(as.character(wcvp_endemic)) %in%
+                           c("endemic", "true", "yes", "1"), "endemic", "non-endemic")]
+  print(e[, .(species = .N, median_HDI = round(median(HDI), 2),
+              zero = sum(HDI == 0),
+              pct_zero = round(100 * mean(HDI == 0), 1)), by = endemic])
+
+  ## the comparison can only include species that were scored at all
+  da <- copy(d[!is.na(wcvp_endemic) & wcvp_endemic != "" &
+            tolower(as.character(wcvp_endemic)) != "missing data"])
+  da[, endemic := fifelse(tolower(as.character(wcvp_endemic)) %in%
+                            c("endemic", "true", "yes", "1"), "endemic", "non-endemic")]
+  cat("\nunscorable, which the comparison cannot include:\n")
+  print(da[, .(species = .N, unscorable = sum(is.na(HDI)),
+               pct = round(100 * mean(is.na(HDI)), 1)), by = endemic])
+
+  x <- e[endemic == "endemic", HDI]; y <- e[endemic == "non-endemic", HDI]
+  tt <- t.test(x, y)                      # Welch
+  wt <- wilcox.test(x, y)                 # Mann-Whitney U
+  cat(sprintf("\nWelch t: t = %.2f, df = %.1f, p = %s, difference in means %.2f\n",
+              tt$statistic, tt$parameter, format.pval(tt$p.value, digits = 3),
+              unname(tt$estimate[1] - tt$estimate[2])))
+  cat(sprintf("Mann-Whitney U: W = %s, p = %s, rank-biserial r = %.3f\n",
+              format(wt$statistic, big.mark = ","),
+              format.pval(wt$p.value, digits = 3),
+              2 * wt$statistic / (length(x) * length(y)) - 1))
+  s <- sqrt(((length(x) - 1) * var(x) + (length(y) - 1) * var(y)) /
+              (length(x) + length(y) - 2))
+  cat(sprintf("Cohen's d: %.3f\n", (mean(x) - mean(y)) / s))
+
+  ## 20% trimmed-mean difference with a bootstrap interval (Yuen 1974)
+  tm <- function(v) mean(v, trim = .2)
+  obs <- tm(x) - tm(y)
+  bs  <- replicate(10000, tm(sample(x, length(x), TRUE)) -
+                          tm(sample(y, length(y), TRUE)))
+  cat(sprintf("20%% trimmed-mean difference: %.2f, 95%% CI %.2f to %.2f\n",
+              obs, quantile(bs, .025), quantile(bs, .975)))
+
+  cat("\nwhere the deficit sits, median of each input:\n")
+  print(e[, .(specimens = median(n_sheets), cells = median(n_cells),
+              decades = median(n_bins_occupied),
+              sp_even = round(median(spatial_evenness, na.rm = TRUE), 3),
+              tm_even = round(median(temporal_evenness, na.rm = TRUE), 3),
+              overlap = round(median(overlap_pct, na.rm = TRUE), 1)), by = endemic])
+}
+```
+
+## D.4 Introduced species
+
+```{r results_introduced}
+if ("establishment" %in% names(sc)) {
+  sc[, intro := tolower(as.character(establishment)) == "introduced"]
+  print(sc[, .(species = .N, median_HDI = round(median(HDI), 2),
+               in_top_100 = sum(HDI_rank <= 100)), by = intro])
+}
+```
+
+## D.5 Taxonomic order
+
+Reported as a negative result. An order is a nomenclatural rank, not an
+ecological unit, and with this many species a significance test will detect
+almost any structure, so the effect size is what matters.
+
+```{r results_order}
+if ("order" %in% names(sc)) {
+  o <- sc[!is.na(order) & order != ""]
+  keep <- o[, .N, by = order][N >= 3, order]
+  o <- o[order %in% keep]
+  cat("orders with at least three species:", length(keep),
+      "  species:", nrow(o), "\n")
+  k <- kruskal.test(HDI ~ factor(order), data = o)
+  cat(sprintf("Kruskal-Wallis: H = %.1f, df = %d, p = %s\n",
+              k$statistic, k$parameter, format.pval(k$p.value, digits = 3)))
+  ss <- summary(aov(HDI ~ factor(order), data = o))
+  r2 <- ss[[1]][1, "Sum Sq"] / sum(ss[[1]][, "Sum Sq"])
+  cat(sprintf("variance in HDI attributable to order: %.1f%%, leaving %.1f%% within orders\n",
+              100 * r2, 100 * (1 - r2)))
+
+  big <- o[, .(n = .N, median_HDI = round(median(HDI), 2),
+               iqr = round(IQR(HDI), 2)), by = order][n >= 10][order(-median_HDI)]
+  print(big)
+
+  ## is a small order's high median an artefact of its size?
+  per <- o[, .(n = .N, med = median(HDI), spread = IQR(HDI)), by = order]
+  cat(sprintf("\nmedian HDI against order size:   rho = %.3f, p = %s\n",
+              cor(per$n, per$med, method = "spearman"),
+              format.pval(cor.test(per$n, per$med, method = "spearman")$p.value, digits = 3)))
+  cat(sprintf("spread of HDI against order size: rho = %.3f, p = %s\n",
+              cor(per$n, per$spread, method = "spearman"),
+              format.pval(cor.test(per$n, per$spread, method = "spearman")$p.value, digits = 3)))
+  cat("A positive second correlation with a null first one means small orders\n",
+      "look high and homogeneous because they are too small to express the\n",
+      "heterogeneity larger orders reveal.\n")
+}
+```
+
+<br>
+
+# Part E. Sensitivity analyses
+
+Four construction choices could have been made differently: the resolution at
+which the inputs are computed, the weight given to each dimension, the
+functional form of the aggregation, and whether each dimension earns its
+place. Each is tested below, followed by two analyses that ask which dimension
+drives the ranking and how precisely a single species can be placed.
+
+## E.1 Resolution: grid size and bin width
+
+Grid size enters only the spatial metrics and bin width only the temporal
+ones, so the two cannot interact at the input level and a full factorial would
+add nothing the marginals do not already give. One extreme corner is included
+anyway, because HDI is a product and small shifts in separate terms can
+compound in the aggregate score.
+
+Bin widths of 5, 10, 20 and 40 years are tested and 50 is not: 280 / 50 = 5.6
+would leave a partial final bin and make the coverage term incomparable across
+settings.
+
+```{r sens_settings}
+RUNS <- rbindlist(list(
+  data.table(dir = "baseline_grid10km_bin10yr", grid_km = GRID_KM, bin_yr = BIN_YR, unc = FALSE, mod_end = 2019),
+  data.table(dir = "grid01km",                  grid_km = 1,       bin_yr = BIN_YR, unc = FALSE, mod_end = 2019),
+  data.table(dir = "grid05km",                  grid_km = 5,       bin_yr = BIN_YR, unc = FALSE, mod_end = 2019),
+  data.table(dir = "grid25km",                  grid_km = 25,      bin_yr = BIN_YR, unc = FALSE, mod_end = 2019),
+  data.table(dir = "bin05yr",                   grid_km = GRID_KM, bin_yr = 5,      unc = FALSE, mod_end = 2019),
+  data.table(dir = "bin20yr",                   grid_km = GRID_KM, bin_yr = 20,     unc = FALSE, mod_end = 2019),
+  data.table(dir = "bin40yr",                   grid_km = GRID_KM, bin_yr = 40,     unc = FALSE, mod_end = 2019),
+  data.table(dir = "uncertainty_filter",        grid_km = GRID_KM, bin_yr = BIN_YR, unc = TRUE,  mod_end = 2019),
+  data.table(dir = "window_to2025",             grid_km = GRID_KM, bin_yr = BIN_YR, unc = FALSE, mod_end = 2025),
+  data.table(dir = "corner_grid01km_bin40yr",   grid_km = 1,       bin_yr = 40,     unc = FALSE, mod_end = 2019)))
+
+keep_sp <- d$species            # the analysed set, so exclusions stay excluded
+settings <- list()
+for (i in seq_len(nrow(RUNS))) {
+  s  <- RUNS[i]
+  hs <- h; ms <- m
+  if (s$unc) {
+    if (!all(c("coordinateUncertaintyInMeters") %in% names(h)) ||
+        !all(c("coordinateUncertaintyInMeters") %in% names(m)))
+      stop("the uncertainty run needs coordinateUncertaintyInMeters in both files")
+    hs <- h[is.na(coordinateUncertaintyInMeters) | coordinateUncertaintyInMeters <= UNC_MAX]
+    ms <- m[is.na(coordinateUncertaintyInMeters) | coordinateUncertaintyInMeters <= UNC_MAX]
+  }
+  ms <- ms[year <= s$mod_end]
+  r  <- build_metrics(hs, ms, s$grid_km, s$bin_yr)[species %in% keep_sp]
+  settings[[s$dir]] <- r[!is.na(HDI), .(species, HDI)]
+  fwrite(r, file.path(OUT_DIR, paste0("metrics_", s$dir, ".csv")))
+  cat(sprintf("[%2d/%2d] %-28s grid %2d km  bins %2d yr  unc %-5s modern<=%d  scored %d\n",
+              i, nrow(RUNS), s$dir, s$grid_km, s$bin_yr, s$unc, s$mod_end, nrow(settings[[s$dir]])))
+}
+
+bse <- copy(settings[["baseline_grid10km_bin10yr"]]); setnames(bse, "HDI", "HDI_base")
+set_res <- rbindlist(lapply(names(settings), function(nm) {
+  j <- merge(bse, settings[[nm]], by = "species")
+  j[, `:=`(rb = frank(-HDI_base, ties.method = "average"),
+           rr = frank(-HDI,      ties.method = "average"))]
+  j[, sh := abs(rb - rr)]
+  data.table(run = nm, n_scored = nrow(settings[[nm]]), n_shared = nrow(j),
+             median_HDI = round(median(settings[[nm]]$HDI), 2),
+             rho = round(cor(j$HDI_base, j$HDI, method = "spearman"), 4),
+             median_shift = median(j$sh),
+             q90_shift = as.numeric(quantile(j$sh, .9)),
+             top20_kept = length(intersect(j[order(rb)][1:20, species],
+                                           j[order(rr)][1:20, species])))
+}))
+setorder(set_res, -rho)
+print(set_res)
+fwrite(set_res, file.path(OUT_DIR, "sensitivity_settings.csv"))
+
+nb <- set_res[run != "baseline_grid10km_bin10yr"]
+cat(sprintf("\nrho against the reported ranking: %.3f to %.3f across %d alternatives\n",
+            min(nb$rho), max(nb$rho), nrow(nb)))
+cat(sprintf("at least 0.975 in %d of %d; worst: %s (rho %.3f)\n",
+            nb[rho >= .975, .N], nrow(nb), nb[which.min(rho), run], min(nb$rho)))
+cat("\nAt a 1 km grid almost every specimen occupies a cell of its own, so the\n",
+    "occupied-cell count restates the specimen count and the spatial evenness\n",
+    "term degenerates, a cell holding a single record being read as perfectly\n",
+    "even. The degradation is informative rather than troubling: it reproduces\n",
+    "the behaviour of the earlier 0.01 degree implementation and shows directly\n",
+    "why a coarser reference grid is appropriate.\n")
+```
+
+## E.2 Weights
+
+Equal weighting is a stated assumption, so the question is what any other
+defensible weighting would do. Weight vectors are drawn from a Dirichlet
+distribution centred on equal weights at five concentrations. The 2.5th
+percentile of the resulting rank correlations is reported rather than the
+minimum, which keeps falling as more draws are taken.
+
+```{r sens_weights}
+DIMS <- c("intensity", "spatial", "temporal", "overlap")
+pos  <- d[complete.cases(d[, ..DIMS])]
+pos  <- pos[Reduce(`&`, lapply(DIMS, function(cc) pos[[cc]] > 0))]
+cat("species with every dimension above zero:", nrow(pos), "\n")
+
+LX  <- log(as.matrix(pos[, ..DIMS]))
+H0  <- 100 * exp(rowMeans(LX))
+rk0 <- frank(-H0, ties.method = "average")
+
+ddir <- function(n, k, a) { G <- matrix(rgamma(n * k, shape = a, rate = 1), nrow = n); G / rowSums(G) }
+
+wt_res <- rbindlist(lapply(ALPHAS, function(a) {
+  W  <- ddir(B_WEIGHTS, length(DIMS), a)
+  S  <- LX %*% t(W)
+  rh <- as.vector(cor(H0, S, method = "spearman"))
+  pick <- sample.int(B_WEIGHTS, min(300L, B_WEIGHTS))
+  RK <- apply(S[, pick, drop = FALSE], 2, function(v) frank(-v, ties.method = "average"))
+  data.table(alpha = a,
+             weight_lo95 = round(quantile(W, .025), 3),
+             weight_hi95 = round(quantile(W, .975), 3),
+             rho_q025    = round(quantile(rh, .025), 3),
+             rho_median  = round(median(rh), 3),
+             pct_above_0.95 = round(100 * mean(rh >= .95), 1),
+             median_shift = round(median(apply(abs(RK - rk0), 2, median))),
+             median_rank_width = round(median(apply(RK, 1, function(r)
+               diff(quantile(r, c(.025, .975)))))))
+}))
+print(wt_res)
+fwrite(wt_res, file.path(OUT_DIR, "sensitivity_weights.csv"))
+cat("\nThe reported index is unchanged by this analysis. Averaging over\n",
+    "arbitrary weightings would replace a stated choice with an unstated one.\n")
+```
+
+## E.3 Functional form
+
+Four ways of combining the same four dimensions. The inputs are held fixed and
+only the arithmetic changes, so any difference is caused by the form alone.
+
+```{r sens_form}
+FD <- copy(d[complete.cases(d[, ..DIMS])])
+XF <- as.matrix(FD[, ..DIMS])
+FD[, f_mult := 100 * apply(XF, 1, function(r) prod(r)^(1/4))]        # adopted
+FD[, f_add  := 100 * rowMeans(XF)]                                   # compensatory
+FD[, f_noov := 100 * apply(XF[, 1:3, drop = FALSE], 1, function(r) prod(r)^(1/3))]
+pcf <- prcomp(XF, center = TRUE, scale. = TRUE)
+s1  <- pcf$x[, 1]; if (cor(s1, FD$f_mult) < 0) s1 <- -s1
+FD[, f_pc1 := 100 * (s1 - min(s1)) / (max(s1) - min(s1))]
+
+FORMS <- c(multiplicative = "f_mult", arithmetic = "f_add",
+           no_overlap = "f_noov", first_PC = "f_pc1")
+form_res <- rbindlist(lapply(names(FORMS), function(k) {
+  v <- FD[[FORMS[k]]]
+  data.table(form = k,
+             median = round(median(v), 2),
+             rho_vs_adopted = round(cor(v, FD$f_mult, method = "spearman"), 3),
+             median_rank_shift = median(abs(frank(-v, ties.method = "average") -
+                                            frank(-FD$f_mult, ties.method = "average"))),
+             rho_vs_specimen_count = round(cor(v, FD$n_sheets, method = "spearman"), 3))
+}))
+print(form_res)
+fwrite(form_res, file.path(OUT_DIR, "sensitivity_formulations.csv"))
+
+cat("\nspecies the arithmetic mean rescues, that is, where one dimension buys\n",
+    "off another:\n")
+FD[, gained := frank(-f_mult, ties.method = "average") -
+               frank(-f_add,  ties.method = "average")]
+print(FD[order(-gained)][1:10, .(species, n_sheets, overlap = round(overlap_pct, 1),
+         intensity = round(intensity, 2), overlap_term = round(overlap, 2),
+         gained)])
+cat("\nThe forms agree closely over the whole ranking, so the geometric mean is\n",
+    "defended on its rationale rather than on its aggregate effect: a species\n",
+    "must be adequate on all four dimensions. It continues to decide where the\n",
+    "extreme species land, which is where it is meant to act.\n")
+```
+
+## E.4 Removing a dimension
+
+The hardest version of the question: remove a dimension and also allow any
+reasonable weighting of what is left.
+
+```{r sens_dropone}
+LEVELS <- list(
+  dimensions = list(cols = DIMS, coef = rep(1/4, 4)),
+  inputs     = list(cols = c("intensity", "breadth", "spatial_evenness",
+                             "coverage", "temporal_evenness", "overlap"),
+                    coef = c(1/4, 1/8, 1/8, 1/8, 1/8, 1/4)))
+
+run_loo <- function(lv, label) {
+  cols <- lv$cols; coef <- lv$coef; k <- length(cols)
+  stopifnot(abs(sum(coef) - 1) < 1e-12)
+  x  <- d[complete.cases(d[, ..cols])]
+  x  <- x[Reduce(`&`, lapply(cols, function(cc) x[[cc]] > 0))]
+  M  <- log(as.matrix(x[, ..cols]))
+  Lf <- as.vector(M %*% coef)
+  rkf <- frank(-Lf, ties.method = "average")
+  cat("\n---", label, ":", nrow(M), "species with every component above zero ---\n")
+
+  res <- rbindlist(lapply(c(1, 10, 50), function(a) rbindlist(lapply(seq_len(k), function(j) {
+    W  <- ddir(B_WEIGHTS, k - 1L, a)
+    S  <- M[, -j, drop = FALSE] %*% t(W)
+    rh <- as.vector(cor(Lf, S, method = "spearman"))   # Spearman is invariant to exp()
+    pick <- sample.int(B_WEIGHTS, min(200L, B_WEIGHTS))
+    sh <- vapply(pick, function(b)
+      median(abs(frank(-S[, b], ties.method = "average") - rkf)), numeric(1))
+    t20 <- vapply(pick[1:min(50, length(pick))], function(b)
+      length(intersect(x$species[order(rkf)][1:20],
+                       x$species[order(frank(-S[, b], ties.method = "average"))][1:20])),
+      numeric(1))
+    data.table(alpha = a, dropped = cols[j],
+               rho_q025 = round(quantile(rh, .025), 4),
+               rho_med  = round(median(rh), 4),
+               median_rank_shift = round(median(sh)),
+               top20_kept_med = round(median(t20)))
+  }))))
+  setorder(res, alpha, rho_med)
+  print(res)
+  fwrite(res, file.path(OUT_DIR, paste0("sensitivity_dropone_", label, ".csv")))
+  res
+}
+loo_dim <- run_loo(LEVELS$dimensions, "dimensions")
+loo_inp <- run_loo(LEVELS$inputs,     "inputs")
+
+s10 <- loo_dim[alpha == 10][order(rho_med)]
+cat(sprintf("\nat alpha = 10, removing %s changes the ranking most (median rho %.3f,\nmedian shift %d positions); removing %s changes it least (rho %.3f)\n",
+            s10$dropped[1], s10$rho_med[1], s10$median_rank_shift[1],
+            s10$dropped[.N], s10$rho_med[.N]))
+cat("A dimension that correlates strongly with the others can be removed with\n",
+    "little effect simply because they stand in for it. Read this alongside\n",
+    "E.5, which is not affected by that.\n")
+```
+
+## E.5 Which dimension drives the spread, with intervals
+
+The spread in scores is divided into shares that sum to 100%, one per
+dimension, by decomposing the variance of log HDI by factor component
+(Shorrocks 1982). Because the shares are covariances with the total, a
+component acting as a correction to another can take a negative share. The
+decomposition is bootstrapped over resamples of the species so that each share
+carries an interval.
+
+```{r sens_variance}
+run_var <- function(lv, label) {
+  cols <- lv$cols; coef <- lv$coef; k <- length(cols)
+  x  <- d[complete.cases(d[, ..cols])]
+  x  <- x[Reduce(`&`, lapply(cols, function(cc) x[[cc]] > 0))]
+  M  <- log(as.matrix(x[, ..cols])); n <- nrow(M)
+  cat("\n---", label, ":", n, "species ---\n")
+
+  one <- function(idx) {
+    Mi <- M[idx, , drop = FALSE]
+    li <- as.vector(Mi %*% coef)
+    V  <- var(li)
+    vapply(seq_len(k), function(j) cov(Mi[, j] * coef[j], li) / V, numeric(1))
+  }
+  obs <- one(seq_len(n))
+  SH  <- vapply(seq_len(B_VAR), function(b) one(sample.int(n, n, replace = TRUE)),
+                numeric(k))
+  q   <- t(apply(SH, 1, quantile, c(.025, .975), na.rm = TRUE))
+  tab <- data.table(component = cols, elasticity = round(coef, 3),
+                    share_pct = round(100 * obs, 1),
+                    ci_lo = round(100 * q[, 1], 1),
+                    ci_hi = round(100 * q[, 2], 1),
+                    largest_in_pct_of_resamples =
+                      round(100 * tabulate(apply(SH, 2, which.max), nbins = k) / B_VAR, 1))
+  setorder(tab, -share_pct)
+  print(tab)
+  fwrite(tab, file.path(OUT_DIR, paste0("sensitivity_variance_", label, ".csv")))
+  ord <- order(-obs)
+  cat(sprintf("leader against runner-up: %s had the larger share in %.1f%% of resamples\n",
+              cols[ord[1]], 100 * mean(SH[ord[1], ] > SH[ord[2], ], na.rm = TRUE)))
+  tab
+}
+var_dim <- run_var(LEVELS$dimensions, "dimensions")
+var_inp <- run_var(LEVELS$inputs,     "inputs")
+
+cat("\nThe two analyses answer different questions and both are reported.\n",
+    "Specimen intensity generates most of the spread in scores, because counts\n",
+    "differ by orders of magnitude across the flora. Overlap generates most of\n",
+    "the distinctions, because nothing else in the index records whether the\n",
+    "historical and the modern records fall in the same places. A species with\n",
+    "many specimens usually occupies many cells, so when intensity is removed\n",
+    "spatial breadth substitutes for much of it; when overlap goes, nothing\n",
+    "replaces it. Equal weights therefore do not give equal influence.\n")
+```
+
+## E.6 How precisely can one species be placed
+
+Each species' own records are resampled with replacement and the index
+recomputed. Every replicate holds the same number of specimens as the
+original, drawn at random with replacement, so about a third of the originals
+are absent from any one replicate while others appear twice. The specimen
+count is unchanged; what varies is how the specimens fall across cells and
+decades. Records are drawn as a multinomial over the cell and bin pairs the
+species occupies, which is equivalent to resampling the records themselves and
+far faster.
+
+This treats the sheets that exist as the population. It measures how much a
+score leans on individual specimens, not what would have happened had
+collectors visited different valleys. The second question cannot be answered
+from these data, and saying so is stronger than implying the interval covers
+it.
+
+```{r sens_bootstrap}
+suppressPackageStartupMessages(library(parallel))
+
+## vectorised Gini over a matrix of count columns, same correction as gini()
+gini_mat <- function(M, n1 = GINI_N1, correct = GINI_CORRECT) {
+  k <- nrow(M); S <- colSums(M); mm <- colSums(M > 0)
+  if (k == 1L) return(ifelse(S > 0, n1, NA_real_))
+  Ms <- apply(M, 2L, sort)
+  if (is.null(dim(Ms))) Ms <- matrix(Ms, nrow = k)
+  A <- colSums(Ms * seq_len(k))
+  G <- (2 * A - (2 * k - mm + 1) * S) / (mm * S)
+  G[mm <= 1L] <- n1
+  G[S <= 0]   <- NA_real_
+  if (correct) { ok <- which(mm > 1L); G[ok] <- pmin(G[ok] * mm[ok] / (mm[ok] - 1), 1) }
+  G
+}
+## agreement with the scalar version, on a case with ties and a zero
+stopifnot(abs(gini_mat(matrix(c(5, 3, 0, 1), ncol = 1)) - gini(c(5, 3, 0, 1))) < 1e-12)
+
+hb <- add_cells(copy(h), GRID_KM)
+hb[, tbin := fifelse(dated, HERB_WINDOW[1] +
+                       floor((year - HERB_WINDOW[1]) / BIN_YR) * BIN_YR, NA_integer_)]
+mb <- add_cells(copy(m[year <= MOD_WINDOW[2]]), GRID_KM)
+modc <- unique(mb[, .(species, cell)])
+nmod <- modc[, .(n_cells_modern = .N), by = species]
+
+## only species that received a score can carry an interval
+boot_sp <- d[!is.na(HDI), species]
+cmb <- hb[species %in% boot_sp, .(n = .N), by = .(species, cell, tbin)]
+cmb <- merge(cmb, modc[, .(species, cell, in_mod = TRUE)],
+             by = c("species", "cell"), all.x = TRUE)
+cmb[is.na(in_mod), in_mod := FALSE]
+cmb <- merge(cmb, nmod, by = "species", all.x = TRUE)
+
+MAXS   <- max(d$n_sheets, na.rm = TRUE)
+MAXC   <- max(d$n_cells,  na.rm = TRUE)
+N_BINS <- d$n_bins_possible[1]
+cat("normalisation maxima held fixed at the reported values: sheets", MAXS,
+    " cells", MAXC, " bins", N_BINS, "\n")
+
+boot_one <- function(dt) {
+  N <- sum(dt$n); ncm <- dt$n_cells_modern[1]
+  M <- rmultinom(B_BOOT, N, prob = dt$n / N)
+  ci <- as.integer(factor(dt$cell))
+  CM <- rowsum(M, ci)
+  n_cells <- colSums(CM > 0)
+  gS <- gini_mat(CM)
+  cell_mod <- tapply(dt$in_mod, ci, any)
+  shared <- colSums(CM[as.logical(cell_mod), , drop = FALSE] > 0)
+  ov_pct <- if (is.na(ncm) || ncm <= 0) rep(NA_real_, B_BOOT) else 100 * shared / ncm
+  dd <- !is.na(dt$tbin)
+  if (any(dd)) {
+    bi <- as.integer(factor(dt$tbin[dd]))
+    BM <- rowsum(M[dd, , drop = FALSE], bi)
+    n_bins <- colSums(BM > 0); gT <- gini_mat(BM)
+  } else { n_bins <- rep(0L, B_BOOT); gT <- rep(NA_real_, B_BOOT) }
+  I  <- log1p(N) / log1p(MAXS)
+  Bd <- log1p(n_cells) / log1p(MAXC)
+  S  <- sqrt(Bd * (1 - gS))
+  Tt <- sqrt(pmin(n_bins / N_BINS, 1) * (1 - gT))
+  O  <- log1p(ov_pct) / log1p(100)
+  100 * (I * S * Tt * O)^(1/4)
+}
+
+sp  <- split(cmb, cmb$species)
+res <- mclapply(sp, boot_one, mc.cores = CORES)
+
+Hm <- do.call(rbind, res)
+bt <- data.table(species = names(res),
+                 HDI_lo95 = apply(Hm, 1, quantile, .025, na.rm = TRUE),
+                 HDI_med  = apply(Hm, 1, median, na.rm = TRUE),
+                 HDI_hi95 = apply(Hm, 1, quantile, .975, na.rm = TRUE))
+RK <- apply(-Hm, 2, frank, ties.method = "average", na.last = "keep")
+bt[, `:=`(rank_lo95 = apply(RK, 1, quantile, .025, na.rm = TRUE),
+          rank_hi95 = apply(RK, 1, quantile, .975, na.rm = TRUE))]
+bt[, `:=`(HDI_width = HDI_hi95 - HDI_lo95, rank_width = rank_hi95 - rank_lo95)]
+bt <- merge(bt, d[, .(species, HDI, HDI_rank, n_sheets, n_cells, n_bins_occupied)],
+            by = "species", all.x = TRUE)
+setorder(bt, HDI_rank)
+fwrite(bt, file.path(OUT_DIR, "sensitivity_bootstrap.csv"))
+
+cat(sprintf("\nmedian 95%% rank interval: %d positions of %d\n",
+            round(median(bt$rank_width, na.rm = TRUE)), sum(!is.na(d$HDI))))
+cat(sprintf("median 95%% HDI interval : %.2f points\n",
+            median(bt$HDI_width, na.rm = TRUE)))
+cat(sprintf("within the top 20, median rank interval: %d positions\n",
+            round(median(bt[HDI_rank <= 20, rank_width], na.rm = TRUE))))
+cat("\ninterval width by specimen count:\n")
+print(bt[, .(species = .N,
+             median_rank_width = round(median(rank_width, na.rm = TRUE)),
+             median_HDI_width  = round(median(HDI_width, na.rm = TRUE), 2)),
+         by = .(sheets = cut(n_sheets, c(0, 10, 25, 50, 100, 250, 1000, Inf),
+                labels = c("1-10", "11-25", "26-50", "51-100", "101-250",
+                           "251-1000", "1000+")))][order(sheets)])
+cat("\nWidth is greatest in the middle of the specimen range. The sparsest\n",
+    "species are held near the bottom by their other inputs and cannot move\n",
+    "far, which is why their intervals are narrow rather than reassuring.\n")
+```
+
+## E.7 One table covering every axis
+
+```{r sens_master}
+master <- rbindlist(list(
+  data.table(axis = "1. Grid and bin resolution",
+             what = sprintf("%d alternative settings", nrow(nb)),
+             rho_worst = min(nb$rho), rho_median = median(nb$rho),
+             detail = sprintf("worst: %s", nb[which.min(rho), run])),
+  data.table(axis = "2. Dimension weights",
+             what = sprintf("Dirichlet sweep, alpha %s",
+                            paste(range(ALPHAS), collapse = " to ")),
+             rho_worst = wt_res[alpha == min(ALPHAS), rho_q025],
+             rho_median = wt_res[alpha == 10, rho_median],
+             detail = sprintf("at alpha = 10, weights %.2f to %.2f",
+                              wt_res[alpha == 10, weight_lo95],
+                              wt_res[alpha == 10, weight_hi95])),
+  data.table(axis = "3. Functional form",
+             what = sprintf("%d alternative forms", nrow(form_res) - 1L),
+             rho_worst = min(form_res[form != "multiplicative", rho_vs_adopted]),
+             rho_median = median(form_res[form != "multiplicative", rho_vs_adopted]),
+             detail = sprintf("arithmetic mean %.3f",
+                              form_res[form == "arithmetic", rho_vs_adopted])),
+  data.table(axis = "4. Removing a dimension",
+             what = "each of 4 removed, the rest reweighted",
+             rho_worst = min(loo_dim[alpha == 10, rho_med]),
+             rho_median = median(loo_dim[alpha == 10, rho_med]),
+             detail = sprintf("most influential: %s",
+                              loo_dim[alpha == 10][which.min(rho_med), dropped]))))
+master[, `:=`(rho_worst = round(rho_worst, 3), rho_median = round(rho_median, 3))]
+print(master)
+fwrite(master, file.path(OUT_DIR, "sensitivity_master.csv"))
+
+cat("\nThe bootstrap is reported separately. It produces intervals rather than a\n",
+    "correlation and answers a different question: not whether the ranking as a\n",
+    "whole survives a different construction, but how firmly one species sits\n",
+    "where it does.\n")
+```
+
+<br>
+
+# Companion scripts
+
+The figures and the remaining descriptive analyses in the manuscript are
+produced by the following scripts, which read `metrics_complete.csv` written
+above and recompute nothing.
+
+| Script | Produces |
+|---|---|
+| `16_results.R` | HDI distribution, the four dimensions, endemics, taxonomic order |
+| `20_ridges.R` | collection-history ridges at three positions on the index |
+| `21_maps.R` | collecting effort, effort by era, and per-species occupancy on the same 10 km grid |
+| `22_use_cases.R` | overlap against temporal coverage, the two study designs |
+| `23_retention.R` | what each HDI threshold retains, by group |
+| `24_elevation.R` | documentation against altitude; writes `species_elevation.csv` |
+| `26_threeD.R` | the three-dimensional views |
+| `27_collecting_curve.R` | two and a half centuries of collecting effort |
+| `28_elevation_panels.R` | specimen elevation and species richness per band |
+
+<br>
+
+# Session information
+
+```{r session}
+sessionInfo()
+```
