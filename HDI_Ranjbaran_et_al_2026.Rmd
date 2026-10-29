@@ -2,7 +2,7 @@
 title: "Herbarium Density Index (HDI): construction and sensitivity analyses"
 subtitle: "Supporting code for Ranjbaran et al."
 author:
-  - "Nevio Dubbini, Miningful Studio (original report and first implementation of the occurrence indices)"
+  - "Nevio Dubbini, University of Pisa (original report and first implementation of the occurrence indices)"
   - "Yasaman Ranjbaran, University of Padova (HDI construction and sensitivity analyses)"
 date: "`r format(Sys.time(), '%d/%m/%Y')`"
 output:
