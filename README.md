@@ -50,7 +50,7 @@ The sensitivity analyses use 10,000 resamples each and are slow. On a cluster, s
 
 ## Credits
 
-The first version of the report and the first implementation of the occurrence indices were written by Nevio Dubbini (Miningful Studio). The revised index construction and the sensitivity analyses were added by Yasaman Ranjbaran.
+The first version of the report and the first implementation of the occurrence indices were written by Nevio Dubbini (University of Pisa). The revised index construction and the sensitivity analyses were added by Yasaman Ranjbaran.
 
 ## Contact
 
